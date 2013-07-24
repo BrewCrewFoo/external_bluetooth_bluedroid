@@ -36,6 +36,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <sys/time.h>
+#include <errno.h>
 
 #include "bt_target.h"
 #include "gki.h"
@@ -52,10 +53,8 @@
 #include "bta_av_ci.h"
 #include "l2c_api.h"
 
-
 #include "btif_av_co.h"
 #include "btif_media.h"
-
 
 #if (BTA_AV_INCLUDED == TRUE)
 #include "sbc_encoder.h"
@@ -167,7 +166,7 @@ static UINT32 a2dp_media_task_stack[(A2DP_MEDIA_TASK_STACK_SIZE + 3) / 4];
 #define BT_MEDIA_TASK A2DP_MEDIA_TASK
 
 #define USEC_PER_SEC 1000000L
-#define TPUT_STATS_INTERVAL_US (1000*1000)
+#define TPUT_STATS_INTERVAL_US (3000*1000)
 
 /*
  * CONGESTION COMPENSATION CTRL ::
@@ -235,11 +234,11 @@ typedef struct
 } tBTIF_MEDIA_CB;
 
 typedef struct {
-    int rx;
-    int rx_tot;
-    int tx;
-    int tx_tot;
-    int ts_prev_us;
+    long long rx;
+    long long rx_tot;
+    long long tx;
+    long long tx_tot;
+    long long ts_prev_us;
 } t_stat;
 
 /*****************************************************************************
@@ -257,6 +256,7 @@ static int media_task_running = MEDIA_TASK_STATE_OFF;
 static void btif_a2dp_data_cb(tUIPC_CH_ID ch_id, tUIPC_EVENT event);
 static void btif_a2dp_ctrl_cb(tUIPC_CH_ID ch_id, tUIPC_EVENT event);
 static void btif_a2dp_encoder_update(void);
+const char* dump_media_event(UINT16 event);
 
 /*****************************************************************************
  **  Externs
@@ -287,8 +287,8 @@ static void tput_mon(int is_rx, int len, int reset)
     /* only monitor one connection at a time for now */
     static t_stat cur_stat;
     struct timespec now;
-    unsigned int prev_us;
-    unsigned int now_us;
+    unsigned long long prev_us;
+    unsigned long long now_us;
 
     if (reset == TRUE)
     {
@@ -310,14 +310,12 @@ static void tput_mon(int is_rx, int len, int reset)
 
     now_us = now.tv_sec*USEC_PER_SEC + now.tv_nsec/1000;
 
-    //APPL_TRACE_DEBUG1("%d us", now_us - cur_stat.ts_prev_us);
-
     if ((now_us - cur_stat.ts_prev_us) < TPUT_STATS_INTERVAL_US)
         return;
 
-    APPL_TRACE_WARNING4("tput rx:%d, tx:%d (kB/s)  (tot : rx %d, tx %d bytes)",
-          (cur_stat.rx)/((now_us - cur_stat.ts_prev_us)/1000),
-          (cur_stat.tx)/((now_us - cur_stat.ts_prev_us)/1000),
+    APPL_TRACE_WARNING4("tput rx:%d, tx:%d (bytes/s)  (tot : rx %d, tx %d bytes)",
+          (cur_stat.rx*1000000)/((now_us - cur_stat.ts_prev_us)),
+          (cur_stat.tx*1000000)/((now_us - cur_stat.ts_prev_us)),
            cur_stat.rx_tot, cur_stat.tx_tot);
 
     /* stats dumped. now reset stats for next interval */
@@ -402,7 +400,8 @@ static void a2dp_cmd_acknowledge(int status)
 {
     UINT8 ack = status;
 
-    APPL_TRACE_EVENT2("## a2dp ack : %s, status %d ##", dump_a2dp_ctrl_event(btif_media_cb.a2dp_cmd_pending), status);
+    APPL_TRACE_EVENT2("## a2dp ack : %s, status %d ##",
+          dump_a2dp_ctrl_event(btif_media_cb.a2dp_cmd_pending), status);
 
     /* sanity check */
     if (btif_media_cb.a2dp_cmd_pending == A2DP_CTRL_CMD_NONE)
@@ -839,10 +838,16 @@ void btif_a2dp_on_open(void)
 
 void btif_a2dp_on_started(tBTA_AV_START *p_av)
 {
-    tBTIF_AV_MEDIA_FEEDINGS media_feeding;
     tBTIF_STATUS status;
 
     APPL_TRACE_EVENT0("## ON A2DP STARTED ##");
+
+    if (p_av == NULL)
+    {
+        /* ack back a local start request */
+        a2dp_cmd_acknowledge(A2DP_CTRL_ACK_SUCCESS);
+        return;
+    }
 
     if (p_av->status == BTA_AV_SUCCESS)
     {
@@ -868,6 +873,24 @@ void btif_a2dp_on_started(tBTA_AV_START *p_av)
     }
 }
 
+
+/*****************************************************************************
+**
+** Function        btif_a2dp_ack_fail
+**
+** Description
+**
+** Returns
+**
+*******************************************************************************/
+
+void btif_a2dp_ack_fail(void)
+{
+    tBTIF_STATUS status;
+
+    APPL_TRACE_EVENT0("## A2DP_CTRL_ACK_FAILURE ##");
+    a2dp_cmd_acknowledge(A2DP_CTRL_ACK_FAILURE);
+}
 
 /*****************************************************************************
 **
@@ -1183,7 +1206,8 @@ static void btif_media_flush_q(BUFFER_Q *p_q)
  *******************************************************************************/
 static void btif_media_task_handle_cmd(BT_HDR *p_msg)
 {
-    VERBOSE("btif_media_task_handle_cmd : %d %s", p_msg->event, dump_media_event(p_msg->event));
+    VERBOSE("btif_media_task_handle_cmd : %d %s", p_msg->event,
+             dump_media_event(p_msg->event));
 
     switch (p_msg->event)
     {
@@ -1468,7 +1492,8 @@ static void btif_media_task_enc_update(BT_HDR *p_msg)
     /* Only update the bitrate and MTU size while timer is running to make sure it has been initialized */
     //if (btif_media_cb.is_tx_timer)
     {
-        btif_media_cb.TxAaMtuSize = ((BTIF_MEDIA_AA_BUF_SIZE - BTIF_MEDIA_AA_SBC_OFFSET - sizeof(BT_HDR))
+        btif_media_cb.TxAaMtuSize = ((BTIF_MEDIA_AA_BUF_SIZE -
+                                      BTIF_MEDIA_AA_SBC_OFFSET - sizeof(BT_HDR))
                 < pUpdateAudio->MinMtuSize) ? (BTIF_MEDIA_AA_BUF_SIZE - BTIF_MEDIA_AA_SBC_OFFSET
                 - sizeof(BT_HDR)) : pUpdateAudio->MinMtuSize;
 
@@ -1534,11 +1559,13 @@ static void btif_media_task_enc_update(BT_HDR *p_msg)
                 s16BitPool = 0;
             }
 
-            APPL_TRACE_EVENT2("bitpool candidate : %d (%d kbps)", s16BitPool, pstrEncParams->u16BitRate);
+            APPL_TRACE_EVENT2("bitpool candidate : %d (%d kbps)",
+                         s16BitPool, pstrEncParams->u16BitRate);
 
             if (s16BitPool > pUpdateAudio->MaxBitPool)
             {
-                APPL_TRACE_WARNING1("btif_media_task_enc_update computed bitpool too large (%d)", s16BitPool);
+                APPL_TRACE_DEBUG1("btif_media_task_enc_update computed bitpool too large (%d)",
+                                    s16BitPool);
                 /* Decrease bitrate */
                 btif_media_cb.encoder.u16BitRate -= BTIF_MEDIA_BITRATE_STEP;
                 /* Record that we have decreased the bitrate */
@@ -1593,7 +1620,6 @@ static void btif_media_task_pcm2sbc_init(tBTIF_MEDIA_INIT_AUDIO_FEEDING * p_feed
     APPL_TRACE_DEBUG1("num_channel:%d", p_feeding->feeding.cfg.pcm.num_channel);
     APPL_TRACE_DEBUG1("bit_per_sample:%d", p_feeding->feeding.cfg.pcm.bit_per_sample);
 
-
     /* Check the PCM feeding sampling_freq */
     switch (p_feeding->feeding.cfg.pcm.sampling_freq)
     {
@@ -1640,11 +1666,13 @@ static void btif_media_task_pcm2sbc_init(tBTIF_MEDIA_INIT_AUDIO_FEEDING * p_feed
 
     if (reconfig_needed != FALSE)
     {
-        APPL_TRACE_DEBUG0("btif_media_task_pcm2sbc_init calls SBC_Encoder_Init");
-        APPL_TRACE_DEBUG1("btif_media_task_pcm2sbc_init mtu %d", btif_media_cb.TxAaMtuSize);
-        APPL_TRACE_DEBUG6("btif_media_task_pcm2sbc_init ch mode %d, nbsubd %d, nb blk %d, alloc method %d, bit rate %d, Smp freq %d",
-                btif_media_cb.encoder.s16ChannelMode, btif_media_cb.encoder.s16NumOfSubBands, btif_media_cb.encoder.s16NumOfBlocks,
-                btif_media_cb.encoder.s16AllocationMethod, btif_media_cb.encoder.u16BitRate, btif_media_cb.encoder.s16SamplingFreq);
+        APPL_TRACE_DEBUG1("btif_media_task_pcm2sbc_init :: mtu %d", btif_media_cb.TxAaMtuSize);
+        APPL_TRACE_DEBUG6("ch mode %d, nbsubd %d, nb %d, alloc %d, rate %d, freq %d",
+                btif_media_cb.encoder.s16ChannelMode,
+                btif_media_cb.encoder.s16NumOfSubBands, btif_media_cb.encoder.s16NumOfBlocks,
+                btif_media_cb.encoder.s16AllocationMethod, btif_media_cb.encoder.u16BitRate,
+                btif_media_cb.encoder.s16SamplingFreq);
+
         SBC_Encoder_Init(&(btif_media_cb.encoder));
     }
     else
@@ -1741,8 +1769,7 @@ static void btif_media_task_feeding_state_reset(void)
 static void btif_media_task_aa_start_tx(void)
 {
     APPL_TRACE_DEBUG2("btif_media_task_aa_start_tx is timer %d, feeding mode %d",
-            btif_media_cb.is_tx_timer, btif_media_cb.feeding_mode);
-
+             btif_media_cb.is_tx_timer, btif_media_cb.feeding_mode);
 
     /* Use a timer to poll the UIPC, get rid of the UIPC call back */
     // UIPC_Ioctl(UIPC_CH_ID_AV_AUDIO, UIPC_REG_CBACK, NULL);
@@ -1752,7 +1779,9 @@ static void btif_media_task_aa_start_tx(void)
     /* Reset the media feeding state */
     btif_media_task_feeding_state_reset();
 
-    APPL_TRACE_EVENT2("starting timer %d ticks (%d)", GKI_MS_TO_TICKS(BTIF_MEDIA_TIME_TICK), TICKS_PER_SEC);
+    APPL_TRACE_EVENT2("starting timer %d ticks (%d)",
+                  GKI_MS_TO_TICKS(BTIF_MEDIA_TIME_TICK), TICKS_PER_SEC);
+
     GKI_start_timer(BTIF_MEDIA_AA_TASK_TIMER_ID, GKI_MS_TO_TICKS(BTIF_MEDIA_TIME_TICK), TRUE);
 }
 
@@ -1791,8 +1820,6 @@ static void btif_media_task_aa_stop_tx(void)
  ** Returns          The number of media frames in this time slice
  **
  *******************************************************************************/
-
-
 static UINT8 btif_get_num_aa_frame(void)
 {
     UINT8 result=0;
@@ -1887,12 +1914,13 @@ BT_HDR *btif_media_aa_readbuf(void)
 BOOLEAN btif_media_aa_read_feeding(tUIPC_CH_ID channel_id)
 {
     UINT16 event;
-    /* coverity[SIGN_EXTENSION] False-positive: Parameter are always in range avoiding sign extension*/
-    UINT16 blocm_x_subband = btif_media_cb.encoder.s16NumOfSubBands * btif_media_cb.encoder.s16NumOfBlocks;
+    UINT16 blocm_x_subband = btif_media_cb.encoder.s16NumOfSubBands * \
+                             btif_media_cb.encoder.s16NumOfBlocks;
     UINT32 read_size;
     UINT16 sbc_sampling = 48000;
     UINT32 src_samples;
-    UINT16 bytes_needed = blocm_x_subband * btif_media_cb.encoder.s16NumOfChannels * sizeof(SINT16);
+    UINT16 bytes_needed = blocm_x_subband * btif_media_cb.encoder.s16NumOfChannels * \
+                          sizeof(SINT16);
     static UINT16 up_sampled_buffer[SBC_MAX_NUM_FRAME * SBC_MAX_NUM_OF_BLOCKS
             * SBC_MAX_NUM_OF_CHANNELS * SBC_MAX_NUM_OF_SUBBANDS * 2];
     static UINT16 read_buffer[SBC_MAX_NUM_FRAME * SBC_MAX_NUM_OF_BLOCKS
@@ -1993,7 +2021,7 @@ BOOLEAN btif_media_aa_read_feeding(tUIPC_CH_ID channel_id)
             btif_media_cb.media_feeding.cfg.pcm.num_channel);
 
     /* re-sample read buffer */
-    /* The output PCM buffer will be stereo, 16 bit per sec */
+    /* The output PCM buffer will be stereo, 16 bit per sample */
     dst_size_used = bta_av_sbc_up_sample((UINT8 *)read_buffer,
             (UINT8 *)up_sampled_buffer + btif_media_cb.media_feeding_state.pcm.aa_feed_residue,
             nb_byte_read,
@@ -2001,7 +2029,7 @@ BOOLEAN btif_media_aa_read_feeding(tUIPC_CH_ID channel_id)
             &src_size_used);
 
 #if (defined(DEBUG_MEDIA_AV_FLOW) && (DEBUG_MEDIA_AV_FLOW == TRUE))
-    APPL_TRACE_DEBUG3("btif_media_aa_read_feeding read_size:%d src_size_used:%d dst_size_used:%d",
+    APPL_TRACE_DEBUG3("btif_media_aa_read_feeding readsz:%d src_size_used:%d dst_size_used:%d",
             read_size, src_size_used, dst_size_used);
 #endif
 
@@ -2047,16 +2075,19 @@ BOOLEAN btif_media_aa_read_feeding(tUIPC_CH_ID channel_id)
 static void btif_media_aa_prep_sbc_2_send(UINT8 nb_frame)
 {
     BT_HDR * p_buf;
-    UINT16 blocm_x_subband = btif_media_cb.encoder.s16NumOfSubBands * btif_media_cb.encoder.s16NumOfBlocks;
+    UINT16 blocm_x_subband = btif_media_cb.encoder.s16NumOfSubBands *
+                             btif_media_cb.encoder.s16NumOfBlocks;
 
 #if (defined(DEBUG_MEDIA_AV_FLOW) && (DEBUG_MEDIA_AV_FLOW == TRUE))
-    APPL_TRACE_DEBUG2("btif_media_aa_prep_sbc_2_send nb_frame %d, TxAaQ %d", nb_frame, btif_media_cb.TxAaQ.count);
+    APPL_TRACE_DEBUG2("btif_media_aa_prep_sbc_2_send nb_frame %d, TxAaQ %d",
+                       nb_frame, btif_media_cb.TxAaQ.count);
 #endif
     while (nb_frame)
     {
         if (NULL == (p_buf = GKI_getpoolbuf(BTIF_MEDIA_AA_POOL_ID)))
         {
-            APPL_TRACE_ERROR1 ("ERROR btif_media_aa_prep_sbc_2_send no buffer TxCnt %d ", btif_media_cb.TxAaQ.count);
+            APPL_TRACE_ERROR1 ("ERROR btif_media_aa_prep_sbc_2_send no buffer TxCnt %d ",
+                                btif_media_cb.TxAaQ.count);
             return;
         }
 
@@ -2070,7 +2101,6 @@ static void btif_media_aa_prep_sbc_2_send(UINT8 nb_frame)
             /* Write @ of allocated buffer in encoder.pu8Packet */
             btif_media_cb.encoder.pu8Packet = (UINT8 *) (p_buf + 1) + p_buf->offset + p_buf->len;
             /* Fill allocated buffer with 0 */
-            /* coverity[SIGN_EXTENSION] False-positive: Parameter are always in range avoiding sign extension*/
             memset(btif_media_cb.encoder.as16PcmBuffer, 0, blocm_x_subband
                     * btif_media_cb.encoder.s16NumOfChannels);
 
@@ -2099,27 +2129,34 @@ static void btif_media_aa_prep_sbc_2_send(UINT8 nb_frame)
         } while (((p_buf->len + btif_media_cb.encoder.u16PacketLength) < btif_media_cb.TxAaMtuSize)
                 && (p_buf->layer_specific < 0x0F) && nb_frame);
 
-        /* coverity[SIGN_EXTENSION] False-positive: Parameter are always in range avoiding sign extension*/
-        btif_media_cb.timestamp += p_buf->layer_specific * blocm_x_subband;
-
-        /* store the time stamp in the buffer to send */
-        *((UINT32 *) (p_buf + 1)) = btif_media_cb.timestamp;
-
-        VERBOSE("TX QUEUE NOW %d", btif_media_cb.TxAaQ.count);
-
-        if (btif_media_cb.tx_flush)
+        if(p_buf->len)
         {
-            APPL_TRACE_DEBUG0("### tx suspended, discarded frame ###");
+            /* timestamp of the media packet header represent the TS of the first SBC frame
+               i.e the timestamp before including this frame */
+            *((UINT32 *) (p_buf + 1)) = btif_media_cb.timestamp;
 
-            if (btif_media_cb.TxAaQ.count > 0)
-                btif_media_flush_q(&(btif_media_cb.TxAaQ));
+            btif_media_cb.timestamp += p_buf->layer_specific * blocm_x_subband;
 
-            GKI_freebuf(p_buf);
-            return;
+            VERBOSE("TX QUEUE NOW %d", btif_media_cb.TxAaQ.count);
+
+            if (btif_media_cb.tx_flush)
+            {
+                APPL_TRACE_DEBUG0("### tx suspended, discarded frame ###");
+
+                if (btif_media_cb.TxAaQ.count > 0)
+                    btif_media_flush_q(&(btif_media_cb.TxAaQ));
+
+                GKI_freebuf(p_buf);
+                return;
+            }
+
+            /* Enqueue the encoded SBC frame in AA Tx Queue */
+            GKI_enqueue(&(btif_media_cb.TxAaQ), p_buf);
         }
-
-        /* Enqueue the encoded SBC frame in AA Tx Queue */
-        GKI_enqueue(&(btif_media_cb.TxAaQ), p_buf);
+        else
+        {
+            GKI_freebuf(p_buf);
+        }
     }
 }
 

@@ -45,6 +45,9 @@ LOCAL_SRC_FILES:= \
     ./avrc/avrc_api.c \
     ./avrc/avrc_sdp.c \
     ./avrc/avrc_opt.c \
+    ./avrc/avrc_bld_tg.c \
+    ./avrc/avrc_pars_tg.c \
+    ./avrc/avrc_utils.c \
     ./hid/hidh_api.c \
     ./hid/hidh_conn.c \
     ./bnep/bnep_main.c \
@@ -80,6 +83,10 @@ LOCAL_SRC_FILES:= \
     ./mcap/mca_csm.c \
     ./mcap/mca_cact.c \
     ./mcap/mca_api.c \
+     ./gap/gap_ble.c \
+    ./gap/gap_api.c \
+    ./gap/gap_utils.c \
+    ./gap/gap_conn.c \
     ./gatt/gatt_sr.c \
     ./gatt/gatt_cl.c \
     ./gatt/gatt_api.c \
@@ -96,6 +103,7 @@ LOCAL_SRC_FILES:= \
     ./avct/avct_lcb_act.c \
     ./smp/smp_main.c \
     ./smp/smp_l2c.c \
+    ./smp/aes.c \
     ./smp/smp_cmac.c \
     ./smp/smp_utils.c \
     ./smp/smp_act.c \
